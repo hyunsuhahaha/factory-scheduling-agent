@@ -116,6 +116,7 @@ class Claimed:
 class JobQueue:
     def __init__(self, redis: Redis, name: str = "cpu", default_limit: int = 2, lease_seconds: int = 30, max_attempts: int = 3):
         self.r = redis
+        self.name = name
         self.default_limit = default_limit
         self.lease_ms = lease_seconds * 1000
         self.max_attempts = max_attempts

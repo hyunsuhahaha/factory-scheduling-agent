@@ -70,7 +70,7 @@ async def test_cancel_queued_job_is_never_run(client, worker):
 async def test_cancel_while_running_discards_result(client, worker, app):
     h = await login(client)
     job = (await client.post("/jobs", json={"problem": problem_json()}, headers=h)).json()
-    claimed = await app.state.queue.claim()
+    claimed = await app.state.queues.by_name["cpu"].claim()
     # 워커가 claim한 직후 사용자가 취소 → 워커의 결과 저장은 조건부 UPDATE에서 버려져야 한다
     await client.post(f"/jobs/{job['id']}/cancel", headers=h)
     await worker._process(claimed)
@@ -127,7 +127,7 @@ async def test_admin_endpoints(client, worker):
     assert (await client.get("/admin/queue", headers=user_h)).status_code == 403
     job = (await client.post("/jobs", json={"problem": problem_json()}, headers=user_h)).json()
     stats = (await client.get("/admin/queue", headers=admin_h)).json()
-    assert stats["queue"]["pending"] == 1 and stats["jobs_by_status"] == {"queued": 1}
+    assert stats["queues"]["cpu"]["pending"] == 1 and stats["jobs_by_status"] == {"queued": 1}
 
     await worker.run_once()
     await client.put(f"/jobs/{job['id']}/feedback", json={"rating": 1, "tags": ["late_order"], "comment": "납기 못 맞춤"}, headers=user_h)

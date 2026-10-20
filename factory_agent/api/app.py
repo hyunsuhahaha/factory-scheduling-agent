@@ -13,14 +13,18 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import Settings, get_settings
-from ..db import Database, Feedback, Job, User, utcnow
+from ..db import Database, DurationModel, Feedback, Job, ProductionRecord, User, utcnow
 from ..queue import JobQueue
 from ..reschedule import ReschedulePatch, apply_patch
 from ..security import create_token, decode_token, hash_password, verify_password
 from ..solver.schema import ScheduleProblem, ScheduleResult
-from ..worker import Worker, build_queue
+from ..worker import KIND_QUEUE, Worker, build_queue
 from .schemas import (
     Credentials,
+    DurationModelOut,
+    HistoryIn,
+    HistoryStats,
+    TrainRequest,
     FeedbackIn,
     FeedbackOut,
     Improvement,
@@ -42,8 +46,18 @@ async def get_session(request: Request) -> AsyncIterator[AsyncSession]:
         yield session
 
 
-def get_queue(request: Request) -> JobQueue:
-    return request.app.state.queue
+class Queues:
+    """자원 클래스별 큐. 작업 kind로 어느 큐에 넣을지 정한다."""
+
+    def __init__(self, queues: dict[str, JobQueue]):
+        self.by_name = queues
+
+    def for_kind(self, kind: str) -> JobQueue:
+        return self.by_name[KIND_QUEUE[kind]]
+
+
+def get_queue(request: Request) -> Queues:
+    return request.app.state.queues
 
 
 def get_cfg(request: Request) -> Settings:
@@ -51,7 +65,7 @@ def get_cfg(request: Request) -> Settings:
 
 
 Session = Annotated[AsyncSession, Depends(get_session)]
-Queue = Annotated[JobQueue, Depends(get_queue)]
+Queue = Annotated[Queues, Depends(get_queue)]
 Cfg = Annotated[Settings, Depends(get_cfg)]
 _bearer = HTTPBearer(auto_error=False)
 
@@ -93,7 +107,7 @@ async def owned_job(job_id: str, user: User, session: AsyncSession) -> Job:
 # ---------------------------------------------------------------- helpers
 
 def summarize(job: Job) -> JobSummary | None:
-    if not job.result:
+    if not job.result or job.kind != "schedule":
         return None
     r = ScheduleResult.model_validate(job.result)
     improvement = None
@@ -118,11 +132,12 @@ def summarize(job: Job) -> JobSummary | None:
         improvement=improvement,
         released_frozen=r.released_frozen,
         solve_seconds=r.solve_seconds,
+        duration_source=r.duration_source,
     )
 
 
-async def to_out(job: Job, queue: JobQueue) -> JobOut:
-    position = await queue.position(job.id) if job.status == "queued" else None
+async def to_out(job: Job, queues: Queues) -> JobOut:
+    position = await queues.for_kind(job.kind).position(job.id) if job.status == "queued" else None
     return JobOut(
         id=job.id,
         kind=job.kind,
@@ -137,29 +152,40 @@ async def to_out(job: Job, queue: JobQueue) -> JobOut:
         started_at=job.started_at,
         finished_at=job.finished_at,
         summary=summarize(job),
+        training=job.result if job.kind == "train_duration_model" else None,
     )
 
 
 async def submit(
-    session: AsyncSession, queue: JobQueue, cfg: Settings, user: User, problem: ScheduleProblem,
-    priority: int, note: str | None, parent_job_id: str | None = None,
+    session: AsyncSession, queues: Queues, cfg: Settings, user: User, payload: dict, priority: int, note: str | None,
+    parent_job_id: str | None = None, kind: str = "schedule", cost_seconds: float = 10,
 ) -> Job:
     queued = await session.scalar(select(func.count()).select_from(Job).where(Job.user_id == user.id, Job.status == "queued"))
     if queued >= cfg.max_queued_per_user:
         raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, f"too many queued jobs (limit {cfg.max_queued_per_user})")
-    job = Job(
-        user_id=user.id, problem=problem.model_dump(mode="json"), priority=priority, note=note, parent_job_id=parent_job_id
-    )
+    job = Job(user_id=user.id, kind=kind, payload=payload, priority=priority, note=note, parent_job_id=parent_job_id)
     session.add(job)
     await session.commit()
     # DB 커밋 후 큐에 넣는다. 큐 등록이 실패하면 작업을 실패로 표시해 유령 작업이 남지 않게 한다.
     try:
-        await queue.enqueue(job.id, user.id, priority, cost_seconds=problem.time_limit_s)
+        await queues.for_kind(kind).enqueue(job.id, user.id, priority, cost_seconds=cost_seconds)
     except Exception:
         job.status, job.error, job.finished_at = "failed", "enqueue failed", utcnow()
         await session.commit()
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "queue unavailable")
     return job
+
+
+async def submit_schedule(
+    session: AsyncSession, queues: Queues, cfg: Settings, user: User, problem: ScheduleProblem,
+    priority: int, note: str | None, parent_job_id: str | None = None,
+) -> Job:
+    if problem.duration_model_id is not None:
+        model = await session.get(DurationModel, problem.duration_model_id)
+        if model is None or model.user_id != user.id:
+            raise HTTPException(422, f"duration model {problem.duration_model_id} not found")
+    return await submit(session, queues, cfg, user, problem.model_dump(mode="json"), priority, note, parent_job_id,
+                        cost_seconds=problem.time_limit_s)
 
 
 # ---------------------------------------------------------------- routes
@@ -201,7 +227,7 @@ jobs = APIRouter(prefix="/jobs", tags=["jobs"])
 
 @jobs.post("", response_model=JobOut, status_code=202)
 async def create_job(body: JobCreate, user: CurrentUser, session: Session, queue: Queue, cfg: Cfg) -> JobOut:
-    job = await submit(session, queue, cfg, user, body.problem, body.priority, body.note)
+    job = await submit_schedule(session, queue, cfg, user, body.problem, body.priority, body.note)
     return await to_out(job, queue)
 
 
@@ -232,7 +258,10 @@ async def get_result(job_id: str, user: CurrentUser, session: Session) -> Schedu
 
 @jobs.get("/{job_id}/problem", response_model=ScheduleProblem)
 async def get_problem(job_id: str, user: CurrentUser, session: Session) -> ScheduleProblem:
-    return ScheduleProblem.model_validate((await owned_job(job_id, user, session)).problem)
+    job = await owned_job(job_id, user, session)
+    if job.kind != "schedule":
+        raise HTTPException(status.HTTP_409_CONFLICT, f"job kind is {job.kind}")
+    return ScheduleProblem.model_validate(job.payload)
 
 
 @jobs.post("/{job_id}/cancel", response_model=JobOut)
@@ -241,7 +270,7 @@ async def cancel_job(job_id: str, user: CurrentUser, session: Session, queue: Qu
     if job.status not in ("queued", "running"):
         raise HTTPException(status.HTTP_409_CONFLICT, f"job is {job.status}")
     # 실행 중이면 워커가 끝난 뒤 조건부 UPDATE에서 결과를 버린다.
-    await queue.cancel(job.id)
+    await queue.for_kind(job.kind).cancel(job.id)
     job.status, job.finished_at = "cancelled", utcnow()
     await session.commit()
     return await to_out(job, queue)
@@ -250,14 +279,16 @@ async def cancel_job(job_id: str, user: CurrentUser, session: Session, queue: Qu
 @jobs.post("/{job_id}/reschedule", response_model=JobOut, status_code=202)
 async def reschedule(job_id: str, patch: ReschedulePatch, user: CurrentUser, session: Session, queue: Queue, cfg: Cfg) -> JobOut:
     parent = await owned_job(job_id, user, session)
+    if parent.kind != "schedule":
+        raise HTTPException(status.HTTP_409_CONFLICT, f"job kind is {parent.kind}")
     if patch.freeze_until is not None and parent.status != "succeeded":
         raise HTTPException(status.HTTP_409_CONFLICT, "freeze_until needs a succeeded parent job")
     result = ScheduleResult.model_validate(parent.result) if parent.result else None
     try:
-        problem = apply_patch(ScheduleProblem.model_validate(parent.problem), result, patch)
+        problem = apply_patch(ScheduleProblem.model_validate(parent.payload), result, patch)
     except (ValueError, ValidationError) as exc:
         raise HTTPException(422, str(exc))
-    job = await submit(session, queue, cfg, user, problem, parent.priority, patch.reason, parent_job_id=parent.id)
+    job = await submit_schedule(session, queue, cfg, user, problem, parent.priority, patch.reason, parent_job_id=parent.id)
     return await to_out(job, queue)
 
 
@@ -276,13 +307,54 @@ async def put_feedback(job_id: str, body: FeedbackIn, user: CurrentUser, session
                        created_at=fb.created_at, updated_at=fb.updated_at)
 
 
+ml = APIRouter(tags=["ml"])
+
+
+@ml.post("/history", status_code=201)
+async def upload_history(body: HistoryIn, user: CurrentUser, session: Session) -> dict:
+    """MES 작업 실적 적재 (계획 속도, 실제 소요 시간). 소요 시간 예측 모델의 학습 데이터."""
+    session.add_all([ProductionRecord(user_id=user.id, **r.model_dump()) for r in body.records])
+    await session.commit()
+    return {"inserted": len(body.records)}
+
+
+@ml.get("/history/stats", response_model=HistoryStats)
+async def history_stats(user: CurrentUser, session: Session) -> HistoryStats:
+    planned = ProductionRecord.quantity / ProductionRecord.planned_rate * 60
+    rows = (await session.execute(
+        select(ProductionRecord.machine_id, func.count(), func.avg(ProductionRecord.actual_minutes / planned))
+        .where(ProductionRecord.user_id == user.id).group_by(ProductionRecord.machine_id)
+    )).all()
+    return HistoryStats(
+        records=sum(n for _, n, _ in rows),
+        actual_over_planned_by_machine={m: round(float(r), 3) for m, _, r in rows},
+    )
+
+
+@ml.post("/models/train", response_model=JobOut, status_code=202)
+async def train_model(body: TrainRequest, user: CurrentUser, session: Session, queue: Queue, cfg: Cfg) -> JobOut:
+    n = await session.scalar(select(func.count()).select_from(ProductionRecord).where(ProductionRecord.user_id == user.id))
+    if n < 50:
+        raise HTTPException(422, f"need at least 50 production records, have {n}")
+    job = await submit(session, queue, cfg, user, body.model_dump(), 5, body.note, kind="train_duration_model", cost_seconds=30)
+    return await to_out(job, queue)
+
+
+@ml.get("/models", response_model=list[DurationModelOut])
+async def list_models(user: CurrentUser, session: Session) -> list[DurationModelOut]:
+    rows = (await session.scalars(
+        select(DurationModel).where(DurationModel.user_id == user.id).order_by(DurationModel.created_at.desc())
+    )).all()
+    return [DurationModelOut(id=m.id, job_id=m.job_id, metrics=m.metrics, created_at=m.created_at) for m in rows]
+
+
 admin = APIRouter(prefix="/admin", tags=["admin"])
 
 
 @admin.get("/queue")
 async def queue_stats(_: AdminUser, session: Session, queue: Queue) -> dict:
     counts = dict((await session.execute(select(Job.status, func.count()).group_by(Job.status))).all())
-    return {"queue": await queue.stats(), "jobs_by_status": counts}
+    return {"queues": {name: await q.stats() for name, q in queue.by_name.items()}, "jobs_by_status": counts}
 
 
 @admin.put("/users/{user_id}/limit", response_model=UserOut)
@@ -292,7 +364,8 @@ async def set_limit(user_id: int, body: UserLimitIn, _: AdminUser, session: Sess
         raise HTTPException(status.HTTP_404_NOT_FOUND, "user not found")
     user.max_running = body.max_running
     await session.commit()
-    await queue.set_user_limit(user.id, body.max_running)
+    for q in queue.by_name.values():
+        await q.set_user_limit(user.id, body.max_running)
     return UserOut(id=user.id, email=user.email, role=user.role, max_running=user.max_running)
 
 
@@ -340,19 +413,22 @@ def create_app(settings: Settings | None = None, redis=None, run_worker: bool | 
                 from redis.asyncio import Redis
 
                 r = Redis.from_url(settings.redis_url)
-        queue = build_queue(r, settings)
-        app.state.db, app.state.queue, app.state.settings = db, queue, settings
-        worker_task = None
+        queues = Queues({name: build_queue(r, settings, name) for name in sorted(set(KIND_QUEUE.values()))})
+        app.state.db, app.state.queues, app.state.settings = db, queues, settings
+        workers = []
         if run_worker if run_worker is not None else settings.embedded:
-            worker = Worker(db, queue, settings, worker_id="embedded")
-            worker_task = asyncio.create_task(worker.run_forever())
-            app.state.worker = worker
+            workers = [
+                Worker(db, queues.by_name["cpu"], settings, worker_id="embedded-cpu"),
+                Worker(db, queues.by_name["gpu"], settings, worker_id="embedded-gpu", devices=["cpu"]),
+            ]
+        tasks = [asyncio.create_task(w.run_forever()) for w in workers]
+        app.state.workers = workers
         try:
             yield
         finally:
-            if worker_task:
-                app.state.worker.stop()
-                await worker_task
+            for w in workers:
+                w.stop()
+            await asyncio.gather(*tasks)
             if redis is None:
                 await r.aclose()
             await db.dispose()
@@ -366,10 +442,11 @@ def create_app(settings: Settings | None = None, redis=None, run_worker: bool | 
 
     @app.get("/healthz", tags=["ops"])
     async def healthz(request: Request) -> dict:
-        await request.app.state.queue.r.ping()
+        await request.app.state.queues.by_name["cpu"].r.ping()
         return {"ok": True}
 
     app.include_router(auth)
     app.include_router(jobs)
+    app.include_router(ml)
     app.include_router(admin)
     return app

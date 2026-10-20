@@ -37,10 +37,10 @@ class Job(Base):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
-    kind: Mapped[str] = mapped_column(String(32), default="schedule")
+    kind: Mapped[str] = mapped_column(String(32), default="schedule", comment="schedule | train_duration_model")
     status: Mapped[str] = mapped_column(String(16), default="queued")
     priority: Mapped[int] = mapped_column(default=5)
-    problem: Mapped[dict] = mapped_column(JSON)
+    payload: Mapped[dict] = mapped_column(JSON, comment="kind별 입력 (schedule이면 ScheduleProblem)")
     result: Mapped[dict | None] = mapped_column(JSON, default=None)
     error: Mapped[str | None] = mapped_column(Text, default=None)
     attempt: Mapped[int] = mapped_column(default=0)
@@ -67,6 +67,35 @@ class Feedback(Base):
     comment: Mapped[str | None] = mapped_column(Text, default=None)
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(default=utcnow, onupdate=utcnow)
+
+
+class ProductionRecord(Base):
+    """MES 작업 실적: 계획 속도와 실제 소요 시간. 소요 시간 예측 모델의 학습 데이터."""
+
+    __tablename__ = "production_records"
+    __table_args__ = (Index("ix_records_user_started", "user_id", "started_at"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    machine_id: Mapped[str] = mapped_column(String(64))
+    product_id: Mapped[str] = mapped_column(String(64))
+    family: Mapped[str] = mapped_column(String(64))
+    quantity: Mapped[int]
+    planned_rate: Mapped[float]
+    after_setup: Mapped[bool]
+    started_at: Mapped[datetime]
+    actual_minutes: Mapped[float]
+
+
+class DurationModel(Base):
+    __tablename__ = "duration_models"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    job_id: Mapped[str] = mapped_column(ForeignKey("jobs.id"))
+    metrics: Mapped[dict] = mapped_column(JSON)
+    params: Mapped[dict] = mapped_column(JSON, comment="vocab, 정규화 값, 레이어 가중치")
+    created_at: Mapped[datetime] = mapped_column(default=utcnow)
 
 
 class Database:

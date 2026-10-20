@@ -1,6 +1,10 @@
-"""최적화 워커.
+"""작업 워커.
 
-- 큐에서 작업을 claim하고 CP-SAT solve를 프로세스 풀에서 돌린다 (CPU 바운드라 이벤트 루프를 막지 않게).
+큐(자원 클래스)별로 워커를 띄운다.
+  cpu  일정 최적화 (CP-SAT). 슬롯 수만큼 동시 실행.
+  gpu  소요 시간 예측 모델 학습 (PyTorch). 장치(--devices)마다 슬롯 1개, 작업마다 장치 하나를 빌려 쓴다.
+
+- 큐에서 작업을 claim하고 무거운 계산은 프로세스 풀에서 돌린다 (이벤트 루프를 막지 않게).
 - 실행 중에는 lease를 주기적으로 연장한다. 워커가 죽으면 lease가 만료되고 다른 워커의 reaper가 작업을 되돌린다.
 - DB 갱신은 (id, attempt, status='running') 조건부 UPDATE라서, 회수됐거나 취소된 작업의 늦은 결과는 버려진다.
 """
@@ -15,18 +19,23 @@ import socket
 from concurrent.futures import Executor, ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 
-from sqlalchemy import update
+from sqlalchemy import select, update
 
 from .config import Settings, get_settings
-from .db import Database, Job, utcnow
+from .db import Database, DurationModel, Job, ProductionRecord, utcnow
 from .queue import Claimed, JobQueue
 from .solver.cpsat import solve_payload
+
+KIND_QUEUE = {"schedule": "cpu", "train_duration_model": "gpu"}
+MAX_TRAIN_RECORDS = 200_000
 
 log = logging.getLogger("fsa.worker")
 
 
 class Worker:
-    def __init__(self, db: Database, queue: JobQueue, settings: Settings, worker_id: str | None = None, executor: Executor | None = None):
+    def __init__(self, db: Database, queue: JobQueue, settings: Settings, worker_id: str | None = None,
+                 executor: Executor | None = None, devices: list[str] | None = None):
+        """devices: gpu 큐 워커가 나눠 쓸 장치 (예: ["cuda:0", "cuda:1"]). 주면 슬롯 수 = 장치 수."""
         self.db = db
         self.queue = queue
         self.settings = settings
@@ -35,11 +44,16 @@ class Worker:
         self._owns_executor = executor is None
         self._stop = asyncio.Event()
         self._tasks: set[asyncio.Task] = set()
+        self.devices = devices
+        self.slots = len(devices) if devices else settings.worker_slots
+        self._free_devices: asyncio.Queue[str] = asyncio.Queue()
+        for d in devices or []:
+            self._free_devices.put_nowait(d)
 
     @property
     def executor(self) -> Executor:
         if self._executor is None:
-            self._executor = ProcessPoolExecutor(max_workers=self.settings.worker_slots)
+            self._executor = ProcessPoolExecutor(max_workers=self.slots)
         return self._executor
 
     def stop(self) -> None:
@@ -75,7 +89,7 @@ class Worker:
                 update(Job)
                 .where(Job.id == job_id, Job.status.in_(("queued", "running")))
                 .values(status="running", attempt=attempt, worker_id=self.worker_id, started_at=utcnow())
-                .returning(Job.problem)
+                .returning(Job.kind, Job.payload, Job.user_id)
             )
             row = res.first()
             await s.commit()
@@ -86,9 +100,14 @@ class Worker:
         log.info("job %s attempt %d started", job_id, attempt)
         heartbeat = asyncio.create_task(self._heartbeat(job_id))
         retry_later = False
+        model_row: DurationModel | None = None
         try:
-            loop = asyncio.get_running_loop()
-            result = await loop.run_in_executor(self.executor, solve_payload, row.problem, self.settings.solver_threads)
+            if row.kind == "schedule":
+                result = await self._run_schedule(row.payload, row.user_id)
+            elif row.kind == "train_duration_model":
+                result, model_row = await self._run_training(job_id, row.payload, row.user_id)
+            else:
+                raise ValueError(f"unknown job kind {row.kind}")
             values = {"status": "succeeded", "result": result, "error": None}
         except BrokenProcessPool:
             # solve 프로세스가 죽었다 (OOM 등). 풀을 다시 만들고 lease 만료 후 재시도되게 둔다.
@@ -105,16 +124,59 @@ class Worker:
                 await self.queue.complete(job_id)
 
         async with self.db.session() as s:
+            if model_row is not None and values["status"] == "succeeded":  # 모델 저장과 작업 완료를 한 트랜잭션으로
+                s.add(model_row)
+                await s.flush()
+                values["result"] = {"model_id": model_row.id, "metrics": model_row.metrics}
             res = await s.execute(
                 update(Job)
                 .where(Job.id == job_id, Job.attempt == attempt, Job.status == "running")
                 .values(finished_at=utcnow(), **values)
             )
-            await s.commit()
+            if res.rowcount == 0:
+                await s.rollback()
+            else:
+                await s.commit()
         if res.rowcount == 0:
             log.warning("job %s attempt %d result discarded (cancelled or reassigned)", job_id, attempt)
         else:
             log.info("job %s attempt %d %s", job_id, attempt, values["status"])
+
+    async def _run_schedule(self, payload: dict, user_id: int) -> dict:
+        model = None
+        model_id = payload.get("duration_model_id")
+        if model_id is not None:
+            async with self.db.session() as s:
+                row = await s.get(DurationModel, model_id)
+            if row is None or row.user_id != user_id:
+                raise ValueError(f"duration model {model_id} not found")
+            model = (row.id, row.params)
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(self.executor, solve_payload, payload, self.settings.solver_threads, model)
+
+    async def _run_training(self, job_id: str, payload: dict, user_id: int) -> tuple[dict, DurationModel]:
+        from .ml.model import train_payload
+
+        async with self.db.session() as s:
+            rows = (await s.scalars(
+                select(ProductionRecord).where(ProductionRecord.user_id == user_id)
+                .order_by(ProductionRecord.started_at.desc()).limit(MAX_TRAIN_RECORDS)
+            )).all()
+        records = [{
+            "machine_id": r.machine_id, "product_id": r.product_id, "family": r.family, "quantity": r.quantity,
+            "planned_rate": r.planned_rate, "after_setup": r.after_setup, "started_at": r.started_at.isoformat(),
+            "actual_minutes": r.actual_minutes,
+        } for r in rows]
+        device = await self._free_devices.get() if self.devices else "cpu"
+        try:
+            loop = asyncio.get_running_loop()
+            out = await loop.run_in_executor(
+                self.executor, train_payload, records, device, payload.get("epochs", 300), payload.get("test_fraction", 0.2)
+            )
+        finally:
+            if self.devices:
+                self._free_devices.put_nowait(device)
+        return {}, DurationModel(user_id=user_id, job_id=job_id, metrics=out["metrics"], params=out["params"])
 
     async def _heartbeat(self, job_id: str) -> None:
         interval = max(1.0, self.settings.lease_seconds / 3)
@@ -130,11 +192,11 @@ class Worker:
             self._executor = None
 
     async def run_forever(self) -> None:
-        slots = asyncio.Semaphore(self.settings.worker_slots)
+        slots = asyncio.Semaphore(self.slots)
         reap_every = max(1.0, self.settings.lease_seconds / 2)
         last_reap = 0.0
         loop = asyncio.get_running_loop()
-        log.info("worker %s started (slots=%d)", self.worker_id, self.settings.worker_slots)
+        log.info("worker %s started (queue=%s slots=%d devices=%s)", self.worker_id, self.queue.name, self.slots, self.devices)
         while not self._stop.is_set():
             if loop.time() - last_reap >= reap_every:
                 try:
@@ -166,23 +228,38 @@ class Worker:
         log.info("worker %s stopped", self.worker_id)
 
 
-def build_queue(redis, settings: Settings) -> JobQueue:
+def build_queue(redis, settings: Settings, name: str = "cpu") -> JobQueue:
     return JobQueue(
         redis,
+        name=name,
         default_limit=settings.max_running_per_user,
         lease_seconds=settings.lease_seconds,
         max_attempts=settings.max_attempts,
     )
 
 
-async def _amain() -> None:
+def _detect_devices() -> list[str]:
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            return [f"cuda:{i}" for i in range(torch.cuda.device_count())]
+    except ImportError:
+        pass
+    return ["cpu"]
+
+
+async def _amain(args) -> None:
     from redis.asyncio import Redis
 
     settings = get_settings()
     db = Database(settings.database_url)
     await db.create_all()
     redis = Redis.from_url(settings.redis_url)
-    worker = Worker(db, build_queue(redis, settings), settings)
+    devices = None
+    if args.queue == "gpu":
+        devices = args.devices.split(",") if args.devices else _detect_devices()
+    worker = Worker(db, build_queue(redis, settings, args.queue), settings, devices=devices)
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
@@ -198,11 +275,13 @@ async def _amain() -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="factory scheduling worker")
+    parser.add_argument("--queue", choices=sorted(set(KIND_QUEUE.values())), default="cpu")
+    parser.add_argument("--devices", help="gpu 큐 장치 목록 (예: cuda:0,cuda:1). 생략하면 자동 감지, 없으면 cpu 1개")
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args()
     logging.basicConfig(level=args.log_level, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     try:
-        asyncio.run(_amain())
+        asyncio.run(_amain(args))
     except KeyboardInterrupt:
         pass
 

@@ -19,6 +19,7 @@ def settings(tmp_path):
         max_queued_per_user=3,
         solver_threads=2,
         lease_seconds=30,
+        create_schema=True,
     )
 
 
@@ -45,7 +46,7 @@ async def client(app):
 @pytest.fixture
 def worker(app, settings):
     pool = ThreadPoolExecutor(max_workers=1)
-    yield Worker(app.state.db, app.state.queue, settings, worker_id="test", executor=pool)
+    yield Worker(app.state.db, app.state.queues.by_name["cpu"], settings, worker_id="test", executor=pool)
     pool.shutdown()
 
 
@@ -54,3 +55,10 @@ async def login(client, email="user@example.com", password="password123") -> dic
     r = await client.post("/auth/token", json={"email": email, "password": password})
     assert r.status_code == 200, r.text
     return {"Authorization": f"Bearer {r.json()['access_token']}"}
+
+
+@pytest.fixture
+def gpu_worker(app, settings):
+    pool = ThreadPoolExecutor(max_workers=1)
+    yield Worker(app.state.db, app.state.queues.by_name["gpu"], settings, worker_id="test-gpu", executor=pool, devices=["cpu"])
+    pool.shutdown()
