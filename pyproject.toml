@@ -31,6 +31,7 @@ dev = ["pytest>=8", "pytest-asyncio>=0.23", "fakeredis[lua]>=2.23"]
 [project.scripts]
 fsa-worker = "factory_agent.worker:main"
 fsa-mcp = "factory_agent.mcp_server:main"
+fsa-agent = "factory_agent.agent.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["factory_agent*"]
