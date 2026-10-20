@@ -41,6 +41,8 @@ def build_tasks(problem: ScheduleProblem, clock: Clock) -> list[Task]:
         durations = {
             machine_id: max(1, math.ceil(order.quantity / rate * 60)) for machine_id, rate in product.rates.items()
         }
+        override = (problem.duration_minutes or {}).get(order.id, {})
+        durations |= {m: max(1, int(v)) for m, v in override.items() if m in durations}
         release = 0 if order.release is None else max(0, clock.to_min(order.release))
         tasks.append(
             Task(

@@ -183,6 +183,35 @@ def solve(problem: ScheduleProblem, threads: int = 8) -> ScheduleResult:
     )
 
 
-def solve_payload(problem: dict, threads: int = 8) -> dict:
-    """프로세스 풀에서 호출하는 진입점. pickle 가능한 dict만 주고받는다."""
-    return solve(ScheduleProblem.model_validate(problem), threads).model_dump(mode="json")
+def apply_duration_model(problem: ScheduleProblem, model_id: int, params: dict) -> ScheduleProblem:
+    """예측 모델로 주문 × 가능 설비별 소요 시간을 채운다.
+
+    교체 직후·야간 여부는 계획 시점에 모르므로 0.5(기댓값)로 넣는다.
+    """
+    from ..ml.model import predict_minutes
+
+    products = {p.id: p for p in problem.products}
+    keys, rows = [], []
+    for order in problem.orders:
+        product = products[order.product_id]
+        for machine_id, rate in product.rates.items():
+            keys.append((order.id, machine_id))
+            rows.append({"machine_id": machine_id, "product_id": product.id, "family": product.family, "quantity": order.quantity,
+                         "planned_minutes": order.quantity / rate * 60, "after_setup": 0.5, "night": 0.5})
+    minutes = predict_minutes(params, rows)
+    table: dict[str, dict[str, int]] = {}
+    for (order_id, machine_id), m in zip(keys, minutes):
+        table.setdefault(order_id, {})[machine_id] = max(1, round(float(m)))
+    return problem.model_copy(update={"duration_minutes": table})
+
+
+def solve_payload(problem: dict, threads: int = 8, model: tuple[int, dict] | None = None) -> dict:
+    """프로세스 풀에서 호출하는 진입점. pickle 가능한 dict만 주고받는다. model = (model_id, params)."""
+    p = ScheduleProblem.model_validate(problem)
+    source = "given" if p.duration_minutes else "planned_rate"
+    if model is not None:
+        p = apply_duration_model(p, *model)
+        source = f"model:{model[0]}"
+    result = solve(p, threads)
+    result.duration_source = source
+    return result.model_dump(mode="json")

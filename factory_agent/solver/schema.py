@@ -104,6 +104,12 @@ class ScheduleProblem(BaseModel):
     frozen: list[FrozenAssignment] = Field(default_factory=list)
     weights: ObjectiveWeights = Field(default_factory=ObjectiveWeights)
     time_limit_s: float = Field(default=10, gt=0, le=120)
+    duration_model_id: int | None = Field(
+        default=None, description="학습된 소요 시간 예측 모델 id. 주면 계획 속도 대신 예측 소요 시간으로 일정을 짠다."
+    )
+    duration_minutes: dict[str, dict[str, int]] | None = Field(
+        default=None, description="주문 id -> 설비 id -> 소요 분. 있으면 계획 속도 계산을 덮어쓴다 (워커가 예측 모델로 채움)."
+    )
 
     @field_validator("horizon_start")
     @classmethod
@@ -176,4 +182,5 @@ class ScheduleResult(BaseModel):
     released_frozen: list[str] = Field(
         default_factory=list, description="고장 구간과 겹쳐 고정을 풀고 다시 배치한 주문"
     )
+    duration_source: str = Field(default="planned_rate", description="planned_rate | model:<id> | given")
     solve_seconds: float = 0.0
