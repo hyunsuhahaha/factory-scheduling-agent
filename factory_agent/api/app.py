@@ -170,7 +170,9 @@ auth = APIRouter(prefix="/auth", tags=["auth"])
 @auth.post("/register", response_model=UserOut, status_code=201)
 async def register(body: Credentials, session: Session, cfg: Cfg) -> UserOut:
     email = body.email.lower()
-    user = User(email=email, password_hash=hash_password(body.password), role="admin" if email in cfg.admin_emails else "user")
+    # PBKDF2는 수백 ms CPU를 쓰므로 이벤트 루프를 막지 않게 스레드에서 돌린다.
+    password_hash = await asyncio.to_thread(hash_password, body.password)
+    user = User(email=email, password_hash=password_hash, role="admin" if email in cfg.admin_emails else "user")
     session.add(user)
     try:
         await session.commit()
@@ -182,7 +184,7 @@ async def register(body: Credentials, session: Session, cfg: Cfg) -> UserOut:
 @auth.post("/token", response_model=TokenOut)
 async def token(body: Credentials, session: Session, cfg: Cfg) -> TokenOut:
     user = await session.scalar(select(User).where(User.email == body.email.lower()))
-    if user is None or not verify_password(body.password, user.password_hash):
+    if user is None or not await asyncio.to_thread(verify_password, body.password, user.password_hash):
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid email or password")
     return TokenOut(
         access_token=create_token(user.id, user.role, cfg.jwt_secret, cfg.jwt_ttl_minutes), expires_in=cfg.jwt_ttl_minutes * 60
