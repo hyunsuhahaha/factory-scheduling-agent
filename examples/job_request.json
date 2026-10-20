@@ -1,0 +1,217 @@
+{
+  "problem": {
+    "horizon_start": "2026-11-02T08:00:00",
+    "machines": [
+      {
+        "id": "EXT-1",
+        "name": null,
+        "downtime": [],
+        "initial_family": "HDPE"
+      },
+      {
+        "id": "EXT-2",
+        "name": null,
+        "downtime": [],
+        "initial_family": "HDPE"
+      },
+      {
+        "id": "EXT-3",
+        "name": null,
+        "downtime": [],
+        "initial_family": "LDPE"
+      }
+    ],
+    "products": [
+      {
+        "id": "P01",
+        "family": "LDPE",
+        "rates": {
+          "EXT-1": 645.5,
+          "EXT-3": 824.9
+        }
+      },
+      {
+        "id": "P02",
+        "family": "LLDPE",
+        "rates": {
+          "EXT-2": 654.0
+        }
+      },
+      {
+        "id": "P03",
+        "family": "HDPE",
+        "rates": {
+          "EXT-3": 373.1
+        }
+      },
+      {
+        "id": "P04",
+        "family": "PP",
+        "rates": {
+          "EXT-1": 410.3,
+          "EXT-3": 297.4
+        }
+      },
+      {
+        "id": "P05",
+        "family": "LDPE",
+        "rates": {
+          "EXT-1": 353.0
+        }
+      },
+      {
+        "id": "P06",
+        "family": "LLDPE",
+        "rates": {
+          "EXT-1": 604.7
+        }
+      },
+      {
+        "id": "P07",
+        "family": "HDPE",
+        "rates": {
+          "EXT-3": 963.5,
+          "EXT-1": 1106.6,
+          "EXT-2": 1068.8
+        }
+      },
+      {
+        "id": "P08",
+        "family": "PP",
+        "rates": {
+          "EXT-1": 692.5,
+          "EXT-2": 471.2
+        }
+      }
+    ],
+    "orders": [
+      {
+        "id": "SO-001",
+        "product_id": "P06",
+        "quantity": 4800,
+        "due": "2026-11-03T05:25:00",
+        "release": "2026-11-02T08:00:00",
+        "weight": 1
+      },
+      {
+        "id": "SO-002",
+        "product_id": "P01",
+        "quantity": 5300,
+        "due": "2026-11-03T13:35:00",
+        "release": "2026-11-02T17:15:00",
+        "weight": 1
+      },
+      {
+        "id": "SO-003",
+        "product_id": "P02",
+        "quantity": 4900,
+        "due": "2026-11-03T06:50:00",
+        "release": "2026-11-02T08:00:00",
+        "weight": 2
+      },
+      {
+        "id": "SO-004",
+        "product_id": "P06",
+        "quantity": 4900,
+        "due": "2026-11-02T20:03:00",
+        "release": "2026-11-02T08:00:00",
+        "weight": 1
+      },
+      {
+        "id": "SO-005",
+        "product_id": "P08",
+        "quantity": 5000,
+        "due": "2026-11-02T18:34:00",
+        "release": "2026-11-02T08:00:00",
+        "weight": 1
+      },
+      {
+        "id": "SO-006",
+        "product_id": "P03",
+        "quantity": 7100,
+        "due": "2026-11-03T09:38:00",
+        "release": "2026-11-02T08:00:00",
+        "weight": 1
+      },
+      {
+        "id": "SO-007",
+        "product_id": "P08",
+        "quantity": 3200,
+        "due": "2026-11-02T22:46:00",
+        "release": "2026-11-02T08:00:00",
+        "weight": 1
+      },
+      {
+        "id": "SO-008",
+        "product_id": "P01",
+        "quantity": 4200,
+        "due": "2026-11-03T11:08:00",
+        "release": "2026-11-02T08:00:00",
+        "weight": 1
+      },
+      {
+        "id": "SO-009",
+        "product_id": "P01",
+        "quantity": 5500,
+        "due": "2026-11-03T12:41:00",
+        "release": "2026-11-02T11:04:00",
+        "weight": 1
+      },
+      {
+        "id": "SO-010",
+        "product_id": "P07",
+        "quantity": 1200,
+        "due": "2026-11-03T10:53:00",
+        "release": "2026-11-02T08:48:00",
+        "weight": 1
+      },
+      {
+        "id": "SO-011",
+        "product_id": "P07",
+        "quantity": 5600,
+        "due": "2026-11-02T21:30:00",
+        "release": "2026-11-02T08:00:00",
+        "weight": 2
+      },
+      {
+        "id": "SO-012",
+        "product_id": "P07",
+        "quantity": 1100,
+        "due": "2026-11-03T08:28:00",
+        "release": "2026-11-02T08:00:00",
+        "weight": 2
+      }
+    ],
+    "default_setup_minutes": 45,
+    "setup_rules": [
+      {
+        "from_family": "PP",
+        "to_family": "LDPE",
+        "minutes": 120
+      },
+      {
+        "from_family": "LDPE",
+        "to_family": "PP",
+        "minutes": 90
+      },
+      {
+        "from_family": "LDPE",
+        "to_family": "LLDPE",
+        "minutes": 20
+      },
+      {
+        "from_family": "LLDPE",
+        "to_family": "LDPE",
+        "minutes": 20
+      }
+    ],
+    "frozen": [],
+    "weights": {
+      "tardiness": 100,
+      "makespan": 1
+    },
+    "time_limit_s": 10.0
+  },
+  "priority": 5,
+  "note": "11월 1주차 압출 계획"
+}
