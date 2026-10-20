@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
 
+env:
+  PIP_EXTRA_INDEX_URL: https://download.pytorch.org/whl/cpu
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -17,10 +20,12 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
           cache: pip
-      - run: pip install -e ".[dev]"
+      - run: pip install -e ".[dev,ml]"
       - run: pytest -q
+      # 정답 호출만 내는 가짜 모델로 agent 평가 하네스·채점기 전체를 점검 (API 키 불필요)
+      - run: python scripts/run_agent_eval.py --oracle --concurrency 6
 
-  # 실제 Postgres + Redis로 API·워커를 띄워 부하 테스트를 짧게 돌린다.
+  # 실제 Postgres + Redis로 마이그레이션 → API·cpu 워커 2대·gpu 큐 워커 기동 → 부하 테스트·모델 학습·지표 확인
   integration:
     runs-on: ubuntu-latest
     needs: test
@@ -44,17 +49,28 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
-      - run: pip install -e ".[dev]"
-      - run: |
+      - run: pip install -e ".[dev,ml]"
+      - name: migrate (and verify no drift between migrations and models)
+        run: |
+          alembic upgrade head
+          alembic check
+      - name: start services
+        run: |
           uvicorn factory_agent.main:app --port 8000 &
-          fsa-worker &
-          fsa-worker &
+          fsa-worker --queue cpu &
+          fsa-worker --queue cpu &
+          fsa-worker --queue gpu &
           for i in $(seq 30); do curl -sf localhost:8000/healthz && break; sleep 1; done
-          python scripts/loadtest.py --users 5 --jobs-per-user 4 --orders 15 --time-limit 3
+      - run: python scripts/loadtest.py --users 5 --jobs-per-user 4 --orders 15 --time-limit 3
+      - run: python scripts/ml_smoke.py
+      - name: metrics exposed
+        run: curl -sf localhost:8000/metrics | grep -E '^fsa_(jobs_submitted_total|queue_pending)'
 
   docker:
     runs-on: ubuntu-latest
     needs: test
     steps:
       - uses: actions/checkout@v4
-      - run: docker build -t factory-scheduling-agent .
+      - run: FSA_JWT_SECRET=ci-secret-0123456789abcdef0123456789 docker compose config -q
+      - run: docker build -t fsa .
+      - run: docker build -t fsa-ml --build-arg EXTRAS=ml .
