@@ -1,18 +1,30 @@
+x-env: &env
+  FSA_DATABASE_URL: postgresql+asyncpg://fsa:fsa@postgres:5432/fsa
+  FSA_REDIS_URL: redis://redis:6379/0
+  FSA_JWT_SECRET: ${FSA_JWT_SECRET:?set FSA_JWT_SECRET (32+ chars)}
+  FSA_ADMIN_EMAILS: ${FSA_ADMIN_EMAILS:-["admin@example.com"]}
+  FSA_WORKER_SLOTS: ${FSA_WORKER_SLOTS:-2}
+  FSA_SOLVER_THREADS: ${FSA_SOLVER_THREADS:-4}
+  FSA_METRICS_PORT: "9100"
+
 x-app: &app
   build: .
-  environment:
-    FSA_DATABASE_URL: postgresql+asyncpg://fsa:fsa@postgres:5432/fsa
-    FSA_REDIS_URL: redis://redis:6379/0
-    FSA_JWT_SECRET: ${FSA_JWT_SECRET:?set FSA_JWT_SECRET (32+ chars)}
-    FSA_ADMIN_EMAILS: ${FSA_ADMIN_EMAILS:-["admin@example.com"]}
-    FSA_WORKER_SLOTS: ${FSA_WORKER_SLOTS:-2}
-    FSA_SOLVER_THREADS: ${FSA_SOLVER_THREADS:-4}
+  environment: *env
   depends_on:
-    postgres: { condition: service_healthy }
+    migrate: { condition: service_completed_successfully }
     redis: { condition: service_healthy }
   restart: unless-stopped
 
 services:
+  # 스키마 변경은 앱 기동과 분리한다. api·worker는 마이그레이션이 끝난 뒤에 뜬다.
+  migrate:
+    build: .
+    environment: *env
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      postgres: { condition: service_healthy }
+    restart: "no"
+
   api:
     <<: *app
     ports: ["8000:8000"]
@@ -22,14 +34,37 @@ services:
       timeout: 3s
       retries: 5
 
+  # cpu 큐: 일정 최적화 (CP-SAT)
   worker:
     <<: *app
-    command: ["fsa-worker"]
+    command: ["fsa-worker", "--queue", "cpu"]
     stop_grace_period: 2m  # 실행 중인 solve를 마치고 내려가도록
     deploy:
       replicas: 2
       resources:
         limits: { cpus: "8" }
+
+  # gpu 큐: 소요 시간 예측 모델 학습. GPU가 없으면 cpu 장치 1개로 돈다.
+  gpu-worker:
+    <<: *app
+    build:
+      context: .
+      args: { EXTRAS: ml }
+    command: ["fsa-worker", "--queue", "gpu"]
+    stop_grace_period: 5m
+
+  # NVIDIA GPU 노드용: docker compose --profile cuda up
+  gpu-worker-cuda:
+    <<: *app
+    profiles: ["cuda"]
+    build:
+      context: .
+      args: { EXTRAS: ml, TORCH_INDEX: "https://download.pytorch.org/whl/cu124" }
+    command: ["fsa-worker", "--queue", "gpu"]  # 장치는 자동 감지 (cuda:0, cuda:1, ...)
+    deploy:
+      resources:
+        reservations:
+          devices: [{ driver: nvidia, count: all, capabilities: [gpu] }]
 
   # 원격 다중 사용자용 MCP 엔드포인트 (streamable HTTP, http://localhost:8001/mcp).
   # 호출자는 백엔드에서 받은 자기 토큰을 Bearer로 보낸다. 로컬 stdio 모드에는 필요 없다.
@@ -60,6 +95,22 @@ services:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       retries: 10
+
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    volumes: ["./ops/prometheus.yml:/etc/prometheus/prometheus.yml:ro"]
+    ports: ["9090:9090"]
+
+  grafana:
+    image: grafana/grafana:11.1.0
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      - ./ops/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./ops/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports: ["3000:3000"]
+    depends_on: [prometheus]
 
 volumes:
   pgdata:

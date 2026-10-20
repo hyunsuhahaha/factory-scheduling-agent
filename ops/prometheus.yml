@@ -1,0 +1,15 @@
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: api
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["api:8000"]
+
+  # 워커는 replicas가 여러 개라 compose DNS로 모든 컨테이너를 찾는다.
+  - job_name: worker
+    dns_sd_configs:
+      - names: ["worker", "gpu-worker"]
+        type: A
+        port: 9100
