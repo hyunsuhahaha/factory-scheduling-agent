@@ -1,0 +1,66 @@
+x-app: &app
+  build: .
+  environment:
+    FSA_DATABASE_URL: postgresql+asyncpg://fsa:fsa@postgres:5432/fsa
+    FSA_REDIS_URL: redis://redis:6379/0
+    FSA_JWT_SECRET: ${FSA_JWT_SECRET:?set FSA_JWT_SECRET (32+ chars)}
+    FSA_ADMIN_EMAILS: ${FSA_ADMIN_EMAILS:-["admin@example.com"]}
+    FSA_WORKER_SLOTS: ${FSA_WORKER_SLOTS:-2}
+    FSA_SOLVER_THREADS: ${FSA_SOLVER_THREADS:-4}
+  depends_on:
+    postgres: { condition: service_healthy }
+    redis: { condition: service_healthy }
+  restart: unless-stopped
+
+services:
+  api:
+    <<: *app
+    ports: ["8000:8000"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz')"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  worker:
+    <<: *app
+    command: ["fsa-worker"]
+    stop_grace_period: 2m  # 실행 중인 solve를 마치고 내려가도록
+    deploy:
+      replicas: 2
+      resources:
+        limits: { cpus: "8" }
+
+  # 원격 다중 사용자용 MCP 엔드포인트 (streamable HTTP, http://localhost:8001/mcp).
+  # 호출자는 백엔드에서 받은 자기 토큰을 Bearer로 보낸다. 로컬 stdio 모드에는 필요 없다.
+  mcp:
+    <<: *app
+    command: ["fsa-mcp", "--transport", "streamable-http", "--port", "8000"]
+    environment:
+      FSA_API_URL: http://api:8000
+      FSA_MCP_PUBLIC_URL: ${FSA_MCP_PUBLIC_URL:-http://localhost:8001}
+    ports: ["8001:8000"]
+    depends_on:
+      api: { condition: service_healthy }
+
+  postgres:
+    image: postgres:16-alpine
+    environment: { POSTGRES_USER: fsa, POSTGRES_PASSWORD: fsa, POSTGRES_DB: fsa }
+    volumes: ["pgdata:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fsa"]
+      interval: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes: ["redisdata:/data"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 10
+
+volumes:
+  pgdata:
+  redisdata:
