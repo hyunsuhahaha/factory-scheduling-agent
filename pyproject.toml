@@ -27,6 +27,8 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "pytest-asyncio>=0.23", "fakeredis[lua]>=2.23"]
+# 소요 시간 예측 모델 학습 (gpu 큐 워커). 예측만 하는 cpu 워커에는 필요 없다.
+ml = ["torch>=2.2"]
 
 [project.scripts]
 fsa-worker = "factory_agent.worker:main"
