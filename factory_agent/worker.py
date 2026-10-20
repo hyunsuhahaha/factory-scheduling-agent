@@ -23,6 +23,7 @@ from sqlalchemy import select, update
 
 from .config import Settings, get_settings
 from .db import Database, DurationModel, Job, ProductionRecord, utcnow
+from . import metrics
 from .queue import Claimed, JobQueue
 from .solver.cpsat import solve_payload
 
@@ -61,6 +62,8 @@ class Worker:
 
     async def reap(self) -> None:
         requeued, dead = await self.queue.reap()
+        metrics.LEASES_REAPED.labels(self.queue.name, "requeued").inc(len(requeued))
+        metrics.LEASES_REAPED.labels(self.queue.name, "dead").inc(len(dead))
         async with self.db.session() as s:
             for job_id in requeued:
                 await s.execute(update(Job).where(Job.id == job_id, Job.status == "running").values(status="queued", worker_id=None))
@@ -89,13 +92,15 @@ class Worker:
                 update(Job)
                 .where(Job.id == job_id, Job.status.in_(("queued", "running")))
                 .values(status="running", attempt=attempt, worker_id=self.worker_id, started_at=utcnow())
-                .returning(Job.kind, Job.payload, Job.user_id)
+                .returning(Job.kind, Job.payload, Job.user_id, Job.created_at)
             )
             row = res.first()
             await s.commit()
         if row is None:  # 취소됐거나 이미 끝난 작업
             await self.queue.complete(job_id)
             return
+        started_at = utcnow()
+        metrics.JOB_WAIT_SECONDS.labels(row.kind).observe((started_at - row.created_at).total_seconds())
 
         log.info("job %s attempt %d started", job_id, attempt)
         heartbeat = asyncio.create_task(self._heartbeat(job_id))
@@ -141,6 +146,10 @@ class Worker:
             log.warning("job %s attempt %d result discarded (cancelled or reassigned)", job_id, attempt)
         else:
             log.info("job %s attempt %d %s", job_id, attempt, values["status"])
+            metrics.JOBS_FINISHED.labels(row.kind, values["status"]).inc()
+            metrics.JOB_RUN_SECONDS.labels(row.kind, values["status"]).observe((utcnow() - started_at).total_seconds())
+            if row.kind == "schedule" and values["status"] == "succeeded":
+                metrics.observe_schedule_result(values["result"])
 
     async def _run_schedule(self, payload: dict, user_id: int) -> dict:
         model = None
@@ -255,6 +264,10 @@ async def _amain(args) -> None:
     settings = get_settings()
     db = Database(settings.database_url)
     await db.create_all()
+    if settings.metrics_port:
+        from prometheus_client import start_http_server
+
+        start_http_server(settings.metrics_port)
     redis = Redis.from_url(settings.redis_url)
     devices = None
     if args.queue == "gpu":

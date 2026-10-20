@@ -10,6 +10,8 @@ class Settings(BaseSettings):
     redis_url: str = "redis://localhost:6379/0"
     # true면 Redis 대신 프로세스 내 fakeredis를 쓰고 API 프로세스 안에서 워커를 돌린다 (로컬 데모용).
     embedded: bool = False
+    # 독립 워커의 Prometheus 지표 포트 (0이면 끔). API는 /metrics로 노출한다.
+    metrics_port: int = 0
 
     jwt_secret: str = "dev-only-change-me"
     jwt_ttl_minutes: int = 60 * 12

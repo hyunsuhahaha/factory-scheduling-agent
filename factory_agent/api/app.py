@@ -2,16 +2,19 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from contextlib import asynccontextmanager
 from typing import Annotated, AsyncIterator
 
-from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request, Response, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import ValidationError
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from .. import metrics
 from ..config import Settings, get_settings
 from ..db import Database, DurationModel, Feedback, Job, ProductionRecord, User, utcnow
 from ..queue import JobQueue
@@ -173,6 +176,7 @@ async def submit(
         job.status, job.error, job.finished_at = "failed", "enqueue failed", utcnow()
         await session.commit()
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "queue unavailable")
+    metrics.JOBS_SUBMITTED.labels(kind).inc()
     return job
 
 
@@ -439,6 +443,24 @@ def create_app(settings: Settings | None = None, redis=None, run_worker: bool | 
         description="생산 일정 최적화 작업을 비동기로 제출·조회하는 API. MCP 서버가 이 API를 tool로 노출한다.",
         lifespan=lifespan,
     )
+
+    @app.middleware("http")
+    async def http_metrics(request: Request, call_next):
+        started = time.perf_counter()
+        response = await call_next(request)
+        route = request.scope.get("route")
+        path = route.path if route is not None else "unmatched"  # 경로 템플릿으로 묶어 라벨 폭증을 막는다
+        metrics.HTTP_REQUESTS.labels(request.method, path, response.status_code).inc()
+        metrics.HTTP_SECONDS.labels(request.method, path).observe(time.perf_counter() - started)
+        return response
+
+    @app.get("/metrics", tags=["ops"], include_in_schema=False)
+    async def prometheus_metrics(request: Request) -> Response:
+        for name, q in request.app.state.queues.by_name.items():
+            stats = await q.stats()
+            metrics.QUEUE_PENDING.labels(name).set(stats["pending"])
+            metrics.QUEUE_RUNNING.labels(name).set(stats["running"])
+        return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
     @app.get("/healthz", tags=["ops"])
     async def healthz(request: Request) -> dict:
