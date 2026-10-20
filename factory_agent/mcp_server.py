@@ -41,6 +41,13 @@ Typical flow:
 6. Rated speeds are often optimistic. history_stats shows how actual run times compare to plan per machine.
    If the user has a trained duration model (list_duration_models), set problem.duration_model_id so the plan
    uses predicted run times; train_duration_model trains a new one from uploaded production history.
+   With a model the plan accounts for the slower first run after a material change and night shifts, and the
+   summary gives each order's on-time probability (at_risk_orders, expected_late_orders). If the user wants a
+   safer plan, set problem.duration_quantile (e.g. 0.8 or 0.9) and compare with the median plan.
+7. If the plant does not run 24/7, put shifts and holidays in problem.calendar. For "should we run overtime?",
+   add candidate windows to calendar.overtime (or reschedule with add_overtime). The solver opens a window only
+   when it saves more tardiness than weights.overtime_per_hour costs; report overtime_used and the late orders
+   it avoided by comparing with a run without that window (compare_jobs).
 Times are factory-local ISO 8601 without timezone unless the user specifies one.
 """
 
@@ -175,6 +182,8 @@ def build_server(client_factory: Callable[[], ApiClient], public_url: str | None
         Use machine_downtime for breakdowns/maintenance, add_orders(+add_products) for rush orders,
         remove_order_ids for cancellations, order_updates for due date/quantity changes.
         Set freeze_until (usually now) to keep work that already started where it is.
+        add_overtime offers overtime windows the solver may open. The previous plan is the search starting
+        point (warm_start), so a good plan is found sooner after a small change.
         """
         return _compact(await api().request("POST", f"/jobs/{job_id}/reschedule", json=patch.model_dump(mode="json")))
 

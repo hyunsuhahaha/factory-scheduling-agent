@@ -2,6 +2,8 @@
 
 입력: 설비, 제품, 원료 계열, 수량, 계획 소요 시간, 교체 직후 여부, 야간 여부
 출력: log(실제 시간 / 계획 시간) — 계획 대비 보정 배율을 예측한다.
+불확실성: 미학습 실적에서 잰 잔차 표준편차(log_sigma)로 log 배율을 정규분포로 보고, 분위수(P50/P90)와
+몬테카를로 표본을 만든다.
 
 학습은 PyTorch (GPU 워커에서 cuda 장치, 없으면 cpu). 예측은 numpy만으로 한다:
 CPU 최적화 워커가 torch 없이 학습된 가중치를 쓸 수 있게, 모델을 JSON(가중치 리스트)으로 저장한다.
@@ -12,6 +14,7 @@ import math
 import random
 import time
 from datetime import datetime
+from statistics import NormalDist
 
 import numpy as np
 
@@ -67,6 +70,9 @@ def train(records: list[dict], device: str = "cpu", epochs: int = 300, test_frac
     rng.shuffle(records)
     n_test = max(1, int(len(records) * test_fraction))
     test, train_set = records[:n_test], records[n_test:]
+    # 불확실성 보정용: 학습에 쓰지 않은 일부로 잔차 폭을 잰다 (테스트 셋은 커버리지 평가에만 쓴다).
+    n_cal = max(1, len(train_set) // 5)
+    calib, train_set = train_set[:n_cal], train_set[n_cal:]
     vocab = {k: _vocab(train_set, k) for k in ("machine_id", "product_id", "family")}
 
     rows, y = _rows_from_records(train_set)
@@ -92,8 +98,10 @@ def train(records: list[dict], device: str = "cpu", epochs: int = 300, test_frac
         "layers": [[layer.weight.detach().cpu().numpy().tolist(), layer.bias.detach().cpu().numpy().tolist()]
                    for layer in model if isinstance(layer, torch.nn.Linear)],
     }
+    cal_rows, cal_y = _rows_from_records(calib)
+    params["log_sigma"] = float(np.std(cal_y - predict_log_ratio(params, cal_rows)))
     metrics = evaluate(params, test)
-    metrics |= {"train_records": len(train_set), "test_records": len(test), "device": device,
+    metrics |= {"train_records": len(train_set), "calibration_records": len(calib), "test_records": len(test), "device": device,
                 "epochs": epochs, "train_seconds": round(time.perf_counter() - started, 2)}
     return {"params": params, "metrics": metrics}
 
@@ -108,9 +116,11 @@ def predict_log_ratio(params: dict, rows: list[dict]) -> np.ndarray:
     return x[:, 0]
 
 
-def predict_minutes(params: dict, rows: list[dict]) -> np.ndarray:
+def predict_minutes(params: dict, rows: list[dict], quantile: float = 0.5) -> np.ndarray:
+    """quantile 분위수의 소요 분. 0.5는 중앙값. log_sigma가 없는 예전 모델은 분위수와 상관없이 중앙값."""
     planned = np.array([r["planned_minutes"] for r in rows], dtype=np.float32)
-    return planned * np.exp(predict_log_ratio(params, rows))
+    shift = NormalDist().inv_cdf(quantile) * params.get("log_sigma", 0.0) if quantile != 0.5 else 0.0
+    return planned * np.exp(predict_log_ratio(params, rows) + shift)
 
 
 def evaluate(params: dict, records: list[dict]) -> dict:
@@ -126,7 +136,9 @@ def evaluate(params: dict, records: list[dict]) -> dict:
 
     mae_p, mape_p = stats(planned)
     mae_m, mape_m = stats(predicted)
-    return {"mae_minutes_planned": mae_p, "mape_planned_pct": mape_p, "mae_minutes_model": mae_m, "mape_model_pct": mape_m}
+    p90 = predict_minutes(params, rows, quantile=0.9)
+    return {"mae_minutes_planned": mae_p, "mape_planned_pct": mape_p, "mae_minutes_model": mae_m, "mape_model_pct": mape_m,
+            "p90_coverage_pct": round(float((actual <= p90).mean() * 100), 1), "log_sigma": round(params.get("log_sigma", 0.0), 4)}
 
 
 def train_payload(records: list[dict], device: str, epochs: int, test_fraction: float) -> dict:

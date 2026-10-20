@@ -2,6 +2,7 @@
 
 freeze_until 이전에 시작하는 작업은 이미 현장에 지시됐다고 보고 설비·시각을 고정한다.
 고정 작업이 새 고장 구간과 겹치면 solver가 고정을 풀고 다시 배치한다 (결과의 released_frozen).
+나머지 작업의 이전 배정은 hint로 넘겨, solver가 이전 해 근처에서 탐색을 시작하게 한다 (warm start).
 """
 from __future__ import annotations
 
@@ -9,7 +10,16 @@ from datetime import datetime
 
 from pydantic import BaseModel, Field
 
-from .solver.schema import FrozenAssignment, Order, Product, ScheduleProblem, ScheduleResult, TimeWindow
+from .solver.schema import (
+    FrozenAssignment,
+    HintAssignment,
+    Order,
+    OvertimeWindow,
+    Product,
+    ScheduleProblem,
+    ScheduleResult,
+    TimeWindow,
+)
 
 
 class MachineDowntime(TimeWindow):
@@ -32,6 +42,10 @@ class ReschedulePatch(BaseModel):
     add_orders: list[Order] = Field(default_factory=list)
     remove_order_ids: list[str] = Field(default_factory=list)
     order_updates: list[OrderUpdate] = Field(default_factory=list)
+    add_overtime: list[OvertimeWindow] = Field(
+        default_factory=list, description="잔업·특근 후보 구간 추가. solver가 비용 대비 쓸지 정한다 (캘린더가 있을 때만 의미 있음)"
+    )
+    warm_start: bool = Field(default=True, description="이전 일정을 탐색 시작점으로 쓴다")
     time_limit_s: float | None = Field(default=None, gt=0, le=120)
 
 
@@ -66,6 +80,19 @@ def apply_patch(problem: ScheduleProblem, result: ScheduleResult | None, patch: 
             if a.start < patch.freeze_until and a.order_id not in removed:
                 frozen[a.order_id] = FrozenAssignment(order_id=a.order_id, machine_id=a.machine_id, start=a.start).model_dump()
     data["frozen"] = list(frozen.values())
+
+    if patch.add_overtime:
+        if data.get("calendar") is None:
+            raise ValueError("add_overtime needs a work calendar on the original problem")
+        data["calendar"]["overtime"] += [w.model_dump(mode="python") for w in patch.add_overtime]
+
+    data["hint"] = []
+    if patch.warm_start and result is not None:
+        data["hint"] = [
+            HintAssignment(order_id=a.order_id, machine_id=a.machine_id, start=a.start).model_dump()
+            for a in result.assignments
+            if a.order_id not in removed and a.order_id not in frozen
+        ]
 
     if patch.horizon_start is not None:
         data["horizon_start"] = patch.horizon_start

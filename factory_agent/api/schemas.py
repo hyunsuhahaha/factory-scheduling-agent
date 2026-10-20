@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 
 from pydantic import BaseModel, Field, field_validator
 
-from ..solver.schema import ScheduleMetrics, ScheduleProblem
+from ..solver.schema import OrderRisk, OvertimeUse, ScheduleMetrics, ScheduleProblem
 
 
 class Credentials(BaseModel):
@@ -50,6 +50,10 @@ class JobSummary(BaseModel):
     released_frozen: list[str] = []
     solve_seconds: float = 0
     duration_source: str = "planned_rate"
+    overtime_used: list[OvertimeUse] = []
+    expected_late_orders: float | None = Field(default=None, description="몬테카를로 평균 지연 주문 수 (예측 모델 사용 시)")
+    at_risk_orders: list[OrderRisk] = Field(default=[], description="납기 준수 확률 90% 미만 주문 (낮은 순)")
+    hint_source: str = "baseline"
 
 
 class JobOut(BaseModel):

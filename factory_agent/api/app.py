@@ -136,6 +136,10 @@ def summarize(job: Job) -> JobSummary | None:
         released_frozen=r.released_frozen,
         solve_seconds=r.solve_seconds,
         duration_source=r.duration_source,
+        overtime_used=r.overtime_used,
+        expected_late_orders=r.expected_late_orders,
+        at_risk_orders=[x for x in r.risk or [] if x.on_time_probability < 0.9],
+        hint_source=r.hint_source,
     )
 
 

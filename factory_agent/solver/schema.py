@@ -5,7 +5,7 @@ API, 워커, MCP 서버가 같은 스키마를 공유한다. 시각은 timezone 
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date, datetime, time, timezone
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -89,9 +89,69 @@ class FrozenAssignment(BaseModel):
         return _naive(v)
 
 
+class HintAssignment(BaseModel):
+    """재계산 warm start용 이전 해. 제약이 아니라 탐색 시작점이다."""
+
+    order_id: str
+    machine_id: str
+    start: datetime
+
+    @field_validator("start")
+    @classmethod
+    def _norm(cls, v: datetime) -> datetime:
+        return _naive(v)
+
+
+class DurationVariants(BaseModel):
+    """설비 하나에서 주문 하나의 소요 분. 직전 제품군 교체 여부와 시작 시각의 야간 여부에 따라 달라진다."""
+
+    base: int = Field(gt=0)
+    after_setup: int = Field(gt=0, description="제품군을 바꾼 직후 (안정화 시간 포함)")
+    night: int = Field(gt=0, description="야간 조에 시작")
+    after_setup_night: int = Field(gt=0)
+
+    def pick(self, after_setup: bool, night: bool) -> int:
+        if after_setup:
+            return self.after_setup_night if night else self.after_setup
+        return self.night if night else self.base
+
+
+class Shift(BaseModel):
+    """반복 근무 구간. end <= start면 다음 날로 넘어가는 조 (예: 20:00~08:00)."""
+
+    weekdays: list[int] = Field(default=[0, 1, 2, 3, 4], description="0=월 … 6=일. 조가 시작하는 요일")
+    start: time
+    end: time
+
+    @field_validator("weekdays")
+    @classmethod
+    def _days(cls, v: list[int]) -> list[int]:
+        if not v or any(d < 0 or d > 6 for d in v):
+            raise ValueError("weekdays must be 0..6")
+        return sorted(set(v))
+
+
+class OvertimeWindow(TimeWindow):
+    """근무 외 시간 중 잔업·특근으로 열 수 있는 구간. 쓰면 설비마다 비용이 든다."""
+
+    machine_ids: list[str] | None = Field(default=None, description="잔업 가능한 설비. 없으면 전체")
+
+
+class WorkCalendar(BaseModel):
+    """설비가 돌 수 있는 시간. 근무 외 시간에는 작업을 시작하거나 걸쳐 둘 수 없다."""
+
+    shifts: list[Shift] = Field(min_length=1)
+    holidays: list[date] = Field(default_factory=list, description="이 날짜에 시작하는 조는 쉰다")
+    overtime: list[OvertimeWindow] = Field(default_factory=list)
+    machine_ids: list[str] | None = Field(default=None, description="캘린더를 적용할 설비. 없으면 전체 (24시간 설비는 빼고 적는다)")
+
+
 class ObjectiveWeights(BaseModel):
     tardiness: int = Field(default=100, ge=0, description="가중 납기 지연(분)당 비용")
     makespan: int = Field(default=1, ge=0, description="전체 완료 시각(분)당 비용")
+    overtime_per_hour: int = Field(
+        default=6000, ge=0, description="설비 1대 잔업 1시간 비용. 기본값은 가중치 1 주문의 1시간 지연과 같다"
+    )
 
 
 class ScheduleProblem(BaseModel):
@@ -108,8 +168,18 @@ class ScheduleProblem(BaseModel):
         default=None, description="학습된 소요 시간 예측 모델 id. 주면 계획 속도 대신 예측 소요 시간으로 일정을 짠다."
     )
     duration_minutes: dict[str, dict[str, int]] | None = Field(
-        default=None, description="주문 id -> 설비 id -> 소요 분. 있으면 계획 속도 계산을 덮어쓴다 (워커가 예측 모델로 채움)."
+        default=None, description="주문 id -> 설비 id -> 소요 분. 있으면 계획 속도 계산을 덮어쓴다."
     )
+    sequence_durations: dict[str, dict[str, DurationVariants]] | None = Field(
+        default=None,
+        description="주문 id -> 설비 id -> 교체 직후·야간별 소요 분. solver가 순서와 시작 시각에 맞는 값을 고른다 (워커가 예측 모델로 채움).",
+    )
+    duration_quantile: float = Field(
+        default=0.5, ge=0.5, le=0.99, description="예측 모델을 쓸 때 계획에 넣을 소요 시간 분위수. 0.9면 보수적 계획"
+    )
+    night_hours: tuple[int, int] = Field(default=(20, 8), description="야간 조 (시작 시, 끝 시)")
+    calendar: WorkCalendar | None = Field(default=None, description="없으면 24시간 가동")
+    hint: list[HintAssignment] = Field(default_factory=list, description="이전 해 (재계산 warm start). 비우면 납기순 규칙 해로 시작")
 
     @field_validator("horizon_start")
     @classmethod
@@ -138,7 +208,16 @@ class ScheduleProblem(BaseModel):
         for f in self.frozen:
             if f.order_id not in known_orders:
                 raise ValueError(f"frozen: unknown order {f.order_id}")
+        if self.calendar is not None:
+            groups = [self.calendar.machine_ids or []] + [w.machine_ids or [] for w in self.calendar.overtime]
+            unknown = {m for g in groups for m in g} - set(machine_ids)
+            if unknown:
+                raise ValueError(f"calendar: unknown machines {sorted(unknown)}")
         return self
+
+    def is_night(self, dt: datetime) -> bool:
+        start, end = self.night_hours
+        return (dt.hour >= start or dt.hour < end) if start > end else start <= dt.hour < end
 
     def setup_minutes(self, from_family: str | None, to_family: str) -> int:
         if from_family is None or from_family == to_family:
@@ -169,6 +248,20 @@ class ScheduleMetrics(BaseModel):
     late_orders: list[str]
     total_setup_minutes: int
     utilization: dict[str, float] = Field(description="설비별 가동률 (생산+세팅 시간 / 전체 완료 시각)")
+    overtime_hours: float = Field(default=0.0, description="쓴 잔업 시간 합 (설비 × 시간)")
+
+
+class OvertimeUse(BaseModel):
+    machine_id: str
+    start: datetime
+    end: datetime
+
+
+class OrderRisk(BaseModel):
+    order_id: str
+    on_time_probability: float
+    p50_end: datetime
+    p90_end: datetime
 
 
 class ScheduleResult(BaseModel):
@@ -183,4 +276,10 @@ class ScheduleResult(BaseModel):
         default_factory=list, description="고장 구간과 겹쳐 고정을 풀고 다시 배치한 주문"
     )
     duration_source: str = Field(default="planned_rate", description="planned_rate | model:<id> | given")
+    overtime_used: list[OvertimeUse] = Field(default_factory=list, description="solver가 열기로 한 잔업 구간")
+    risk: list[OrderRisk] | None = Field(
+        default=None, description="예측 모델로 계획했을 때, 소요 시간 불확실성을 몬테카를로로 돌린 주문별 납기 준수 확률"
+    )
+    expected_late_orders: float | None = Field(default=None, description="몬테카를로 평균 지연 주문 수")
+    hint_source: str = Field(default="baseline", description="baseline | previous (재계산 warm start)")
     solve_seconds: float = 0.0
