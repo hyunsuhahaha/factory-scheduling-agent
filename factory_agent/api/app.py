@@ -406,7 +406,8 @@ def create_app(settings: Settings | None = None, redis=None, run_worker: bool | 
         if not settings.embedded and (settings.jwt_secret == "dev-only-change-me" or len(settings.jwt_secret) < 32):
             raise RuntimeError("set FSA_JWT_SECRET to a random string of 32+ chars")
         db = Database(settings.database_url)
-        await db.create_all()
+        if settings.create_schema or settings.embedded:
+            await db.create_all()
         r = redis
         if r is None:
             if settings.embedded:

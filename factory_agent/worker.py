@@ -263,7 +263,8 @@ async def _amain(args) -> None:
 
     settings = get_settings()
     db = Database(settings.database_url)
-    await db.create_all()
+    if settings.create_schema:
+        await db.create_all()
     if settings.metrics_port:
         from prometheus_client import start_http_server
 
