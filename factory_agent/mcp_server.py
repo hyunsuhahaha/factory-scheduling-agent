@@ -38,6 +38,9 @@ Typical flow:
 4. When the shop floor changes (machine breakdown, rush order, due date change), call reschedule with
    freeze_until = now so already-started work stays put. Report released_frozen if any.
 5. When the user says whether the plan was usable, record it with submit_feedback.
+6. Rated speeds are often optimistic. history_stats shows how actual run times compare to plan per machine.
+   If the user has a trained duration model (list_duration_models), set problem.duration_model_id so the plan
+   uses predicted run times; train_duration_model trains a new one from uploaded production history.
 Times are factory-local ISO 8601 without timezone unless the user specifies one.
 """
 
@@ -102,7 +105,7 @@ class BackendTokenVerifier:
 
 def _compact(job: dict) -> dict:
     """LLM 컨텍스트를 아끼려고 작업 상태에서 필요한 필드만 남긴다."""
-    keep = ("id", "status", "queue_position", "parent_job_id", "note", "error", "summary")
+    keep = ("id", "kind", "status", "queue_position", "parent_job_id", "note", "error", "summary", "training")
     return {k: job[k] for k in keep if job.get(k) is not None}
 
 
@@ -212,7 +215,26 @@ def build_server(client_factory: Callable[[], ApiClient], public_url: str | None
         body = {"rating": rating, "tags": tags or [], "comment": comment}
         return await api().request("PUT", f"/jobs/{job_id}/feedback", json=body)
 
+    @mcp.tool()
+    async def history_stats() -> dict:
+        """Production history summary: record count and actual/planned run-time ratio per machine."""
+        return await api().request("GET", "/history/stats")
+
+    @mcp.tool()
+    async def train_duration_model(epochs: int = 300, note: str | None = None) -> dict:
+        """Train a run-time prediction model from the caller's production history (runs on the GPU queue).
+
+        Returns a job; wait_for_job, then its training field holds model_id and test-set error vs. rated speeds.
+        """
+        return _compact(await api().request("POST", "/models/train", json={"epochs": epochs, "note": note}))
+
+    @mcp.tool()
+    async def list_duration_models() -> list[dict]:
+        """List the caller's trained run-time models with their test-set metrics (newest first)."""
+        return await api().request("GET", "/models")
+
     return mcp
+
 
 
 def main() -> None:
