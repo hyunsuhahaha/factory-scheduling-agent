@@ -3,13 +3,18 @@
 DB가 작업 상태의 원본이고, Redis는 "누가 다음에 무엇을 돌릴지"만 관리한다.
 
 키 (prefix = fsa:{queue}):
-  pending       ZSET  job_id -> score (우선순위 구간 * 1e13 + 등록 ms). 작을수록 먼저.
+  pending       ZSET  job_id -> score (우선순위 구간 * 1e13 + 가상 시작 시각 ms). 작을수록 먼저.
+  user_vt       HASH  user_id -> 사용자의 가상 시각 (fair queuing)
   running       ZSET  job_id -> lease 만료 ms
   owner         HASH  job_id -> user_id
   score         HASH  job_id -> 원래 pending score (재등록 시 순서 유지)
   attempts      HASH  job_id -> 시도 횟수
   user_running  HASH  user_id -> 실행 중 작업 수
   user_limit    HASH  user_id -> 동시 실행 한도 (없으면 기본값)
+
+공정성 (start-time fair queuing): 작업을 넣을 때마다 사용자의 가상 시각을 예상 실행 시간만큼 민다.
+한 사용자가 작업 20개를 한꺼번에 넣어도 그 작업들은 가상 시각상 띄엄띄엄 놓이고,
+뒤늦게 들어온 다른 사용자의 첫 작업이 그 사이에 끼어든다. 우선순위 구간이 가상 시각보다 먼저 비교된다.
 
 모든 상태 전이는 Lua 스크립트로 원자적으로 처리해 워커 여러 대가 동시에 claim해도
 같은 작업을 두 번 가져가거나 사용자 한도를 넘지 않는다.
@@ -20,6 +25,18 @@ import time
 from dataclasses import dataclass
 
 from redis.asyncio import Redis
+
+_ENQUEUE = """
+local pending, owner, score, user_vt = KEYS[1], KEYS[2], KEYS[3], KEYS[4]
+local id, uid, now, cost, bucket = ARGV[1], ARGV[2], tonumber(ARGV[3]), tonumber(ARGV[4]), tonumber(ARGV[5])
+local vt = math.max(now, tonumber(redis.call('HGET', user_vt, uid) or '0'))
+redis.call('HSET', user_vt, uid, vt + cost)
+local s = bucket + vt
+redis.call('HSET', owner, id, uid)
+redis.call('HSET', score, id, s)
+redis.call('ZADD', pending, s, id)
+return tostring(s)
+"""
 
 _CLAIM = """
 local pending, running, owner, attempts, user_running, user_limit = KEYS[1], KEYS[2], KEYS[3], KEYS[4], KEYS[5], KEYS[6]
@@ -106,19 +123,19 @@ class JobQueue:
         self.k_pending, self.k_running = f"{p}:pending", f"{p}:running"
         self.k_owner, self.k_score, self.k_attempts = f"{p}:owner", f"{p}:score", f"{p}:attempts"
         self.k_user_running, self.k_user_limit = f"{p}:user_running", f"{p}:user_limit"
+        self.k_user_vt = f"{p}:user_vt"
+        self._enqueue = redis.register_script(_ENQUEUE)
         self._claim = redis.register_script(_CLAIM)
         self._release = redis.register_script(_RELEASE)
         self._reap = redis.register_script(_REAP)
         self._cancel = redis.register_script(_CANCEL)
 
-    async def enqueue(self, job_id: str, user_id: int, priority: int = 5) -> None:
-        """priority: 0(낮음)~9(긴급)."""
-        score = (9 - priority) * 10**13 + _now_ms()
-        async with self.r.pipeline(transaction=True) as pipe:
-            pipe.hset(self.k_owner, job_id, user_id)
-            pipe.hset(self.k_score, job_id, score)
-            pipe.zadd(self.k_pending, {job_id: score})
-            await pipe.execute()
+    async def enqueue(self, job_id: str, user_id: int, priority: int = 5, cost_seconds: float = 10) -> None:
+        """priority: 0(낮음)~9(긴급). cost_seconds: 예상 실행 시간 (solver time limit). 공정성 가중치로 쓴다."""
+        await self._enqueue(
+            keys=[self.k_pending, self.k_owner, self.k_score, self.k_user_vt],
+            args=[job_id, user_id, _now_ms(), int(cost_seconds * 1000), (9 - priority) * 10**13],
+        )
 
     async def claim(self, scan: int = 200) -> Claimed | None:
         keys = [self.k_pending, self.k_running, self.k_owner, self.k_attempts, self.k_user_running, self.k_user_limit]

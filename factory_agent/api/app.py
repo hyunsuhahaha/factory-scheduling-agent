@@ -154,7 +154,7 @@ async def submit(
     await session.commit()
     # DB 커밋 후 큐에 넣는다. 큐 등록이 실패하면 작업을 실패로 표시해 유령 작업이 남지 않게 한다.
     try:
-        await queue.enqueue(job.id, user.id, priority)
+        await queue.enqueue(job.id, user.id, priority, cost_seconds=problem.time_limit_s)
     except Exception:
         job.status, job.error, job.finished_at = "failed", "enqueue failed", utcnow()
         await session.commit()

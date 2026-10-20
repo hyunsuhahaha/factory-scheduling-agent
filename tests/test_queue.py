@@ -19,6 +19,16 @@ async def test_priority_then_fifo(queue):
     assert order == ["urgent", "normal-1", "normal-2", "low"]
 
 
+async def test_fair_share_interleaves_users(redis):
+    # 사용자 1이 작업 3개를 먼저 몰아 넣고 사용자 2가 1개를 넣으면, 사용자 2의 작업이 사용자 1의 두 번째 작업보다 먼저다.
+    q = JobQueue(redis, default_limit=100)
+    for i in range(3):
+        await q.enqueue(f"u1-{i}", 1, cost_seconds=10)
+    await q.enqueue("u2-0", 2, cost_seconds=10)
+    order = [(await q.claim()).job_id for _ in range(4)]
+    assert order == ["u1-0", "u2-0", "u1-1", "u1-2"]
+
+
 async def test_per_user_limit_lets_other_users_through(queue):
     # 사용자 1이 작업을 여러 개 먼저 넣어도, 한도(1)를 채우면 사용자 2의 작업이 먼저 돈다.
     for i in range(3):
